@@ -2456,6 +2456,8 @@ async function cloudInit() {
 
     // Pull any photos we don't already have locally.
     prefetchPhotosFromCloud();
+    // Push any local-only photos up to cloud (one-time cutover backfill).
+    pushLocalPhotosToCloud();
     return true;
   } catch (e) {
     console.warn('cloudInit failed', e);
@@ -2489,6 +2491,39 @@ async function prefetchPhotosFromCloud() {
         await putPhotoLocal(j.attachmentId, blob);
       }
     } catch (e) { console.warn('attachment prefetch failed', j.attachmentId, e); }
+  }
+}
+
+// Backfill: push any local photo blobs that aren't yet in Firestore.
+// Handles the cutover case where photos existed in IndexedDB before
+// cloud sync was wired up.
+async function pushLocalPhotosToCloud() {
+  if (!cloudEnabled || !window.cloud?.ready || VIEW_ONLY) return;
+  let uploaded = 0;
+  const collectIds = [];
+  for (const entry of state.photoIndex || []) collectIds.push(entry.id);
+  for (const j of state.journal || []) if (j.attachmentId) collectIds.push(j.attachmentId);
+
+  for (const id of collectIds) {
+    try {
+      const localBlob = await getPhoto(id);
+      if (!localBlob) continue; // we don't have it locally either
+      const remote = await window.cloud.getPhoto(id);
+      if (remote && remote.data) continue; // already in cloud
+      const b64 = await blobToBase64(localBlob);
+      await window.cloud.setPhoto(id, {
+        data: b64,
+        type: localBlob.type || '',
+        updatedAt: Date.now()
+      });
+      uploaded++;
+    } catch (e) {
+      console.warn('photo backfill failed', id, e);
+    }
+  }
+  if (uploaded > 0) {
+    console.info('Backfilled', uploaded, 'photos to cloud');
+    toast('Synced ' + uploaded + ' photo' + (uploaded === 1 ? '' : 's') + ' to cloud');
   }
 }
 
