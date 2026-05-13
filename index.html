@@ -1008,7 +1008,9 @@ function load() {
     }
     if (!state.startDate) {
       state.startDate = new Date().toISOString().slice(0,10);
-      save();
+      // Persist locally WITHOUT bumping updatedAt — a fresh, empty session
+      // must never appear "newer" than the real cloud copy.
+      try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch {}
     }
   } catch (e) { console.error('load failed', e); }
 }
@@ -1032,6 +1034,15 @@ function queueCloudSave() {
   clearTimeout(cloudSaveTimer);
   cloudSaveTimer = setTimeout(async () => {
     try {
+      // Safety guard: never push an empty state up if cloud already has data.
+      // This prevents a freshly-cleared device from wiping the canonical copy.
+      if (stateIsEmpty(state)) {
+        const remote = await window.cloud.getState();
+        if (remote && remote.state && !stateIsEmpty(remote.state)) {
+          console.warn('Refusing to push empty state — cloud has data');
+          return;
+        }
+      }
       suppressNextSnapshot = true;
       await window.cloud.setState({ state, updatedAt: state.updatedAt || Date.now() });
     } catch (e) {
@@ -2323,10 +2334,13 @@ document.getElementById('import-file').addEventListener('change', async (e) => {
     const data = JSON.parse(text);
     if (!data.state) throw new Error('Invalid backup');
     state = data.state;
+    state.updatedAt = Date.now(); // ensure imported data wins over any older cloud copy
     save();
-    // Restore photos
+    // Clear local IndexedDB blobs only — leave cloud copies alone in case
+    // the cloud still has photos the JSON doesn't. The subsequent putPhoto
+    // calls will re-upload everything from the JSON.
     const { keys } = await getAllPhotos();
-    for (const k of keys) await deletePhoto(k);
+    for (const k of keys) await deletePhoto(k, { skipCloud: true });
     if (data.photos) {
       for (const [id, b64] of Object.entries(data.photos)) {
         const blob = await base64ToBlob(b64);
@@ -2412,9 +2426,11 @@ function waitForCloud(timeout = 4000) {
 }
 
 function stateIsEmpty(s) {
+  if (!s) return true;
   return (!s.journal || s.journal.length === 0) &&
          (!s.weights || s.weights.length === 0) &&
          (!s.sizes || s.sizes.length === 0) &&
+         (!s.expenses || s.expenses.length === 0) &&
          (!s.photoIndex || s.photoIndex.length === 0);
 }
 
@@ -2430,17 +2446,23 @@ async function cloudInit() {
     const localAt = state.updatedAt || 0;
     const remoteAt = remote?.updatedAt || 0;
 
-    if (remote && remote.state && remoteAt >= localAt && !stateIsEmpty(remote.state)) {
-      // Cloud has newer (or equal, non-empty) data — adopt it.
+    // Rule of thumb: NEVER push empty state to cloud if remote has data.
+    // A fresh / freshly-cleared device must always defer to the cloud.
+    const localEmpty = stateIsEmpty(state);
+    const remoteEmpty = !remote || !remote.state || stateIsEmpty(remote.state);
+
+    if (!remoteEmpty && (remoteAt >= localAt || localEmpty)) {
+      // Remote has real data and is newer — OR local is empty. Adopt remote.
       state = remote.state;
       save({ skipCloud: true });
-    } else if ((!remote || !remote.state || stateIsEmpty(remote.state)) && !stateIsEmpty(state)) {
-      // Cloud empty but we have local data — push it up.
+    } else if (remoteEmpty && !localEmpty) {
+      // Cloud is empty and we have data — push it up.
       await cloud.setState({ state, updatedAt: state.updatedAt || Date.now() });
-    } else if (remote && remote.state && localAt > remoteAt) {
-      // Local is newer — push up.
+    } else if (!remoteEmpty && !localEmpty && localAt > remoteAt) {
+      // Both populated, local is newer — push up.
       await cloud.setState({ state, updatedAt: localAt });
     }
+    // else: both empty, or local empty and remote empty — do nothing.
 
     // Subscribe to live changes from other devices.
     cloud.onStateChange((payload) => {
