@@ -13,6 +13,8 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-app.js";
   import { getFirestore, doc, getDoc, setDoc, deleteDoc, onSnapshot }
     from "https://www.gstatic.com/firebasejs/12.12.1/firebase-firestore.js";
+  import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut, setPersistence, browserLocalPersistence }
+    from "https://www.gstatic.com/firebasejs/12.12.1/firebase-auth.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyC8Fh3zy5dt97SqF15QSh3d6_RiVuBW5nw",
@@ -26,6 +28,13 @@
   try {
     const app = initializeApp(firebaseConfig);
     const db = getFirestore(app);
+    const auth = getAuth(app);
+
+    // Persist auth across browser sessions (so sign-in survives refresh)
+    setPersistence(auth, browserLocalPersistence).catch(e => console.warn('auth persistence', e));
+
+    // Handle redirect result (mobile Safari uses redirect flow)
+    getRedirectResult(auth).catch(e => console.warn('redirect result', e));
 
     window.cloud = {
       ready: true,
@@ -43,6 +52,21 @@
       },
       setPhoto: (id, payload) => setDoc(doc(db, 'photos', id), payload),
       deletePhoto: (id) => deleteDoc(doc(db, 'photos', id)),
+      auth: {
+        signIn: async () => {
+          const provider = new GoogleAuthProvider();
+          // Use popup on desktop, redirect on mobile (popups are flaky on iOS Safari)
+          const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+          if (isMobile) {
+            return signInWithRedirect(auth, provider);
+          } else {
+            return signInWithPopup(auth, provider);
+          }
+        },
+        signOut: () => signOut(auth),
+        onChange: (cb) => onAuthStateChanged(auth, cb),
+        currentUser: () => auth.currentUser
+      }
     };
     window.dispatchEvent(new Event('cloud-ready'));
   } catch (e) {
@@ -652,6 +676,46 @@
     font-weight: 600;
   }
 
+  /* Auth banner (shown when not signed in, non-view mode) */
+  .auth-banner {
+    background: var(--moss-dark);
+    color: white;
+    padding: 10px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 13px;
+  }
+  .auth-banner button {
+    background: white;
+    color: var(--moss-dark);
+    border: none;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .auth-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--ink-soft);
+    margin-left: 8px;
+  }
+  .auth-status .who { font-weight: 600; color: var(--moss-dark); }
+  .auth-status button {
+    background: none;
+    border: none;
+    color: var(--ink-soft);
+    text-decoration: underline;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0;
+  }
+
   /* Growth summary */
   .growth-summary {
     display: grid;
@@ -715,6 +779,11 @@
 
 <div id="view-only-banner" class="view-only-banner" style="display:none;">
   👀 View-only mode — changes won't be saved
+</div>
+
+<div id="auth-banner" class="auth-banner" style="display:none;">
+  <span>🔒 Sign in to add or edit entries</span>
+  <button id="auth-signin-btn">Sign in with Google</button>
 </div>
 
 <main>
@@ -1182,6 +1251,113 @@ if (VIEW_ONLY) {
   document.getElementById('view-only-banner').style.display = 'block';
   document.getElementById('fab').style.display = 'none';
 }
+
+/* ============== Auth (sign-in for editor mode) ============== */
+let currentUser = null;
+const fabEl = document.getElementById('fab');
+const authBanner = document.getElementById('auth-banner');
+
+function setEditingEnabled(enabled) {
+  // Editor mode requires sign-in. View-only mode is always disabled.
+  if (VIEW_ONLY) {
+    authBanner.style.display = 'none';
+    fabEl.style.display = 'none';
+    return;
+  }
+  if (enabled) {
+    authBanner.style.display = 'none';
+    fabEl.style.display = '';
+  } else {
+    authBanner.style.display = 'flex';
+    fabEl.style.display = 'none';
+  }
+}
+
+// Default state until auth resolves: assume not signed in.
+setEditingEnabled(false);
+
+document.getElementById('auth-signin-btn').addEventListener('click', async () => {
+  if (!window.cloud?.auth) { toast('Sign-in not available'); return; }
+  try {
+    await window.cloud.auth.signIn();
+    // On mobile this triggers a redirect; on desktop the popup resolves here.
+  } catch (e) {
+    console.error('sign-in failed', e);
+    toast('Sign-in failed: ' + (e.code || e.message));
+  }
+});
+
+function renderAuthStatus() {
+  // Replace the auth banner content when signed in (small "Signed in as X" pill)
+  if (currentUser && !VIEW_ONLY) {
+    authBanner.style.display = 'flex';
+    authBanner.innerHTML = '';
+    const left = el('span', { class: 'auth-status' },
+      el('span', {}, '✓ Signed in as '),
+      el('span', { class: 'who', style: 'color:white;' }, currentUser.email || currentUser.displayName || 'editor')
+    );
+    const right = el('button', {
+      style: 'background:transparent; color:white; border:1px solid rgba(255,255,255,0.4); padding:4px 10px; font-size:11px;',
+      onclick: async () => { try { await window.cloud.auth.signOut(); } catch(e){} }
+    }, 'Sign out');
+    authBanner.appendChild(left);
+    authBanner.appendChild(right);
+    // Auto-hide after 4 seconds so it doesn't clutter
+    setTimeout(() => { if (currentUser && !VIEW_ONLY) authBanner.style.display = 'none'; }, 4000);
+  }
+}
+
+async function initAuth() {
+  const cloud = await waitForCloud();
+  if (!cloud || !cloud.ready || !cloud.auth) {
+    // No auth available — fall back to allowing edits (offline / no Firebase)
+    setEditingEnabled(true);
+    return;
+  }
+  let hasSyncedThisSession = false;
+  cloud.auth.onChange(async (user) => {
+    const wasSignedIn = !!currentUser;
+    currentUser = user;
+    if (VIEW_ONLY) {
+      setEditingEnabled(false);
+      return;
+    }
+    if (user) {
+      setEditingEnabled(true);
+      renderAuthStatus();
+      // Post-signin catch-up: if local has data that never made it to cloud
+      // (e.g., writes were blocked during the auth-required window), push
+      // everything up now that we're authorized. Runs once per session.
+      if (!hasSyncedThisSession && !stateIsEmpty(state)) {
+        hasSyncedThisSession = true;
+        try {
+          // Freshen updatedAt so our push is guaranteed to win over any older cloud copy
+          state.updatedAt = Date.now();
+          localStorage.setItem(LS_KEY, JSON.stringify(state));
+          if (cloudEnabled && window.cloud?.ready) {
+            await window.cloud.setState({ state, updatedAt: state.updatedAt });
+            toast('Synced to cloud');
+          }
+          // Also push any local-only photo blobs (photos taken while writes were blocked)
+          pushLocalPhotosToCloud();
+        } catch (e) {
+          console.warn('post-signin sync failed', e);
+          toast('Sync failed — try refreshing');
+        }
+      }
+    } else {
+      setEditingEnabled(false);
+      // Restore the original sign-in banner content (in case it was replaced)
+      authBanner.innerHTML =
+        '<span>🔒 Sign in to add or edit entries</span>' +
+        '<button id="auth-signin-btn">Sign in with Google</button>';
+      document.getElementById('auth-signin-btn').addEventListener('click', async () => {
+        try { await window.cloud.auth.signIn(); } catch (e) { toast('Sign-in failed'); }
+      });
+    }
+  });
+}
+initAuth();
 
 /* ============== Navigation ============== */
 function showView(name) {
